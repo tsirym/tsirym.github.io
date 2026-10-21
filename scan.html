@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#121821">
+    <title>Scanner le QR code</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body { margin: 0; min-height: 100%; }
+        body {
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            background: #121821; color: #e8eefc;
+            padding: 16px calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+        }
+        .wrap { max-width: 460px; margin: 0 auto; }
+        h1 { font-size: 20px; margin: 4px 0 12px; text-align: center; }
+        .video-box {
+            position: relative; width: 100%; aspect-ratio: 1 / 1; overflow: hidden;
+            border-radius: 16px; background: #000;
+        }
+        video { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .frame {
+            position: absolute; inset: 18%; border: 3px solid #ffb703; border-radius: 14px;
+            box-shadow: 0 0 0 100vmax rgba(0,0,0,.35); pointer-events: none;
+        }
+        .status { min-height: 3em; margin: 12px 0; text-align: center; font-size: 15px; line-height: 1.45; }
+        .status.error { color: #ff8f8f; }
+        .status.ok { color: #7dffa8; font-weight: 600; }
+        button, input[type=text], select {
+            width: 100%; min-height: 48px; font-size: 16px; border-radius: 12px;
+            border: 2px solid #3a4a68; background: #1b2434; color: inherit; padding: 10px 14px; margin-top: 10px;
+        }
+        button { font-weight: 600; cursor: pointer; }
+        button.primary { background: #2f6bff; border-color: #2f6bff; }
+        .row { display: flex; gap: 10px; }
+        .row > * { flex: 1; }
+        .hint { font-size: 13px; opacity: .75; text-align: center; margin-top: 16px; line-height: 1.5; }
+        .hidden { display: none !important; }
+        hr { border: 0; border-top: 1px solid #2b3750; margin: 18px 0 8px; }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <h1>Scanner le QR code</h1>
+
+    <div class="video-box" id="videoBox">
+        <video id="video" playsinline muted autoplay></video>
+        <div class="frame"></div>
+    </div>
+
+    <div class="status" id="status">Appuyez sur « Ouvrir la caméra ».</div>
+
+    <button class="primary" id="startBtn" type="button">Ouvrir la caméra</button>
+    <select id="camSelect" class="hidden" aria-label="Choisir la caméra"></select>
+
+    <div class="row">
+        <button type="button" id="photoBtn">Prendre une photo</button>
+        <button type="button" id="backBtn">Retour</button>
+    </div>
+    <input type="file" id="photoInput" accept="image/*" capture="environment" class="hidden">
+
+    <hr>
+    <input type="text" id="manualCode" placeholder="Ou tapez le code du voucher"
+           autocapitalize="none" autocorrect="off" autocomplete="off" spellcheck="false">
+    <button type="button" id="manualBtn">Se connecter avec ce code</button>
+
+    <p class="hint">
+        Si la caméra ne s'ouvre pas : ouvrez cette page dans Chrome ou Safari
+        (pas dans la petite fenêtre de connexion Wi-Fi) et autorisez la caméra.
+    </p>
+</div>
+
+<canvas id="canvas" class="hidden"></canvas>
+
+<script>
+(function () {
+    // Where to send the phone back: the hotspot login URL, passed by login.html as ?back=...
+    var params = new URLSearchParams(location.search);
+    var backUrl = params.get('back') || '';
+    if (!/^https?:\/\//i.test(backUrl)) backUrl = '';
+
+    var video = document.getElementById('video');
+    var canvas = document.getElementById('canvas');
+    var statusEl = document.getElementById('status');
+    var startBtn = document.getElementById('startBtn');
+    var camSelect = document.getElementById('camSelect');
+    var stream = null, loopTimer = null, busy = false, detector = null, done = false;
+
+    function say(text, cls) {
+        statusEl.textContent = text;
+        statusEl.className = 'status' + (cls ? ' ' + cls : '');
+    }
+
+    function extractVoucher(text) {
+        text = (text || '').trim();
+        var m = text.match(/[?&](?:username|user|code|voucher)=([^&#\s]+)/i);
+        if (m) { try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; } }
+        return text;
+    }
+
+    function finish(raw) {
+        var code = extractVoucher(raw);
+        if (!code || done) return;
+        done = true;
+        stopCamera();
+        say('Code trouvé : ' + code + ' — connexion...', 'ok');
+        if (!backUrl) {
+            say('Code trouvé : ' + code + '. Retournez sur la page Wi-Fi et tapez-le.', 'ok');
+            return;
+        }
+        var sep = backUrl.indexOf('?') === -1 ? '?' : '&';
+        setTimeout(function () {
+            location.href = backUrl + sep + 'voucher=' + encodeURIComponent(code);
+        }, 400);
+    }
+
+    function stopCamera() {
+        if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+        if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    }
+
+    // ---- decoding: native BarcodeDetector first, jsQR (loaded on demand) as fallback ----
+    // Tries jsQR.js sitting next to this page first (no extra host to allow in the walled garden),
+    // then the public CDN.
+    var JSQR_SOURCES = ['jsQR.js', 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js'];
+
+    function loadScript(src) {
+        return new Promise(function (resolve, reject) {
+            var s = document.createElement('script');
+            s.src = src;
+            s.onload = function () { window.jsQR ? resolve() : reject(new Error('empty')); };
+            s.onerror = function () { reject(new Error('load')); };
+            document.head.appendChild(s);
+        });
+    }
+
+    var jsqrPromise = null;
+    function loadJsQR() {
+        if (window.jsQR) return Promise.resolve();
+        if (!jsqrPromise) {
+            jsqrPromise = JSQR_SOURCES.reduce(function (p, src) {
+                return p.catch(function () { return loadScript(src); });
+            }, Promise.reject(new Error('start')));
+            jsqrPromise.catch(function () { jsqrPromise = null; });
+        }
+        return jsqrPromise;
+    }
+
+    function decode(cnv) {
+        if ('BarcodeDetector' in window) {
+            try {
+                if (!detector) detector = new BarcodeDetector({ formats: ['qr_code'] });
+                return detector.detect(cnv).then(function (r) { return r && r.length ? r[0].rawValue : null; })
+                    .catch(function () { return null; });
+            } catch (e) { /* fall through */ }
+        }
+        return loadJsQR().then(function () {
+            var ctx = cnv.getContext('2d');
+            var img = ctx.getImageData(0, 0, cnv.width, cnv.height);
+            var res = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
+            return res ? res.data : null;
+        }).catch(function () {
+            say('Le lecteur de QR n\'a pas pu se charger (jsQR.js introuvable). Tapez le code du voucher ci-dessous.', 'error');
+            return null;
+        });
+    }
+
+    // ---- camera ----
+    function withTimeout(promise, ms) {
+        return Promise.race([
+            promise,
+            new Promise(function (_, reject) { setTimeout(function () { reject({ name: 'TimeoutError' }); }, ms); })
+        ]);
+    }
+
+    function explain(err) {
+        var n = err && err.name;
+        if (n === 'NotAllowedError' || n === 'SecurityError')
+            return 'Caméra refusée. Autorisez la caméra pour ce site, ou ouvrez cette page dans Chrome/Safari.';
+        if (n === 'NotFoundError' || n === 'OverconstrainedError')
+            return 'Aucune caméra trouvée sur cet appareil. Utilisez « Prendre une photo » ou tapez le code.';
+        if (n === 'NotReadableError' || n === 'AbortError')
+            return 'La caméra est utilisée par une autre application. Fermez-la puis réessayez.';
+        if (n === 'TimeoutError')
+            return 'La caméra ne répond pas. Ouvrez cette page dans Chrome/Safari, ou utilisez « Prendre une photo ».';
+        return 'Impossible d\'ouvrir la caméra. Utilisez « Prendre une photo » ou tapez le code.';
+    }
+
+    function tryConstraints(list, i, lastErr) {
+        if (i >= list.length) return Promise.reject(lastErr);
+        return withTimeout(navigator.mediaDevices.getUserMedia(list[i]), 10000)
+            .catch(function (e) {
+                // permission problems won't be fixed by other constraints
+                if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) throw e;
+                return tryConstraints(list, i + 1, e);
+            });
+    }
+
+    function startCamera(deviceId) {
+        if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) || !window.isSecureContext) {
+            say('La caméra n\'est pas disponible ici (page non sécurisée). Utilisez « Prendre une photo ».', 'error');
+            return;
+        }
+        stopCamera();
+        done = false;
+        say('Ouverture de la caméra... autorisez l\'accès si demandé.');
+        var list = deviceId
+            ? [{ video: { deviceId: { exact: deviceId } }, audio: false }, { video: true, audio: false }]
+            : [{ video: { facingMode: { ideal: 'environment' } }, audio: false },
+               { video: { facingMode: 'user' }, audio: false },
+               { video: true, audio: false }];
+
+        tryConstraints(list, 0, null).then(function (s) {
+            stream = s;
+            video.srcObject = s;
+            return video.play().catch(function () {});
+        }).then(function () {
+            if (!stream) return;
+            say('Placez le QR code dans le cadre.');
+            startBtn.textContent = 'Relancer la caméra';
+            listCameras();
+            loopTimer = setInterval(scanFrame, 300);
+        }).catch(function (e) {
+            say(explain(e), 'error');
+        });
+    }
+
+    function listCameras() {
+        if (!navigator.mediaDevices.enumerateDevices) return;
+        navigator.mediaDevices.enumerateDevices().then(function (devs) {
+            var cams = devs.filter(function (d) { return d.kind === 'videoinput'; });
+            if (cams.length < 2) { camSelect.classList.add('hidden'); return; }
+            var current = stream && stream.getVideoTracks()[0] && stream.getVideoTracks()[0].getSettings().deviceId;
+            camSelect.innerHTML = '';
+            cams.forEach(function (c, i) {
+                var o = document.createElement('option');
+                o.value = c.deviceId;
+                o.textContent = c.label || ('Caméra ' + (i + 1));
+                if (c.deviceId === current) o.selected = true;
+                camSelect.appendChild(o);
+            });
+            camSelect.classList.remove('hidden');
+        }).catch(function () {});
+    }
+
+    function scanFrame() {
+        if (busy || done || !video.videoWidth) return;
+        busy = true;
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        decode(canvas).then(function (text) {
+            busy = false;
+            if (text) finish(text);
+        });
+    }
+
+    // ---- photo fallback (works even when the live camera is blocked) ----
+    function scanPhoto(file) {
+        if (!file) return;
+        say('Lecture de la photo...');
+        var url = URL.createObjectURL(file);
+        var img = new Image();
+        img.onload = function () {
+            var scale = Math.min(1, 1200 / Math.max(img.width, img.height));
+            canvas.width = Math.round(img.width * scale);
+            canvas.height = Math.round(img.height * scale);
+            canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+            URL.revokeObjectURL(url);
+            decode(canvas).then(function (text) {
+                if (text) finish(text);
+                else say('Aucun QR code trouvé. Rapprochez-vous et réessayez.', 'error');
+            });
+        };
+        img.onerror = function () { say('Photo illisible.', 'error'); };
+        img.src = url;
+    }
+
+    startBtn.addEventListener('click', function () { startCamera(); });
+    camSelect.addEventListener('change', function () { startCamera(camSelect.value); });
+    document.getElementById('photoBtn').addEventListener('click', function () {
+        document.getElementById('photoInput').click();
+    });
+    document.getElementById('photoInput').addEventListener('change', function () {
+        scanPhoto(this.files && this.files[0]);
+        this.value = '';
+    });
+    document.getElementById('backBtn').addEventListener('click', function () {
+        stopCamera();
+        if (backUrl) location.href = backUrl; else history.back();
+    });
+    document.getElementById('manualBtn').addEventListener('click', function () {
+        finish(document.getElementById('manualCode').value);
+    });
+
+    window.addEventListener('pagehide', stopCamera);
+    startCamera();   // try right away; the button is there if the browser wants a tap first
+})();
+</script>
+</body>
+</html>
